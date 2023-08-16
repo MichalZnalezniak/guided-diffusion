@@ -13,8 +13,9 @@ import torch as th
 
 from .nn import mean_flat
 from .losses import normal_kl, discretized_gaussian_log_likelihood
-
-
+import torchvision
+from PIL import Image
+import torch
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     """
     Get a pre-defined beta schedule for the given name.
@@ -380,9 +381,21 @@ class GaussianDiffusion:
         """
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
 
+        if t[0].item() % 50 == 0:
+            sample_temp = ((p_mean_var['pred_xstart'] + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            sample_temp = sample_temp.permute(0, 2, 3, 1)
+            sample_temp = sample_temp.contiguous()
+            image = Image.fromarray(sample_temp[0].cpu().numpy())
+            image.save(f'./pred_xstart_iter{t[0].item()}.png')
+
+
         eps = self._predict_eps_from_xstart(x, t, p_mean_var["pred_xstart"])
+        clean_image = p_mean_var["pred_xstart"]
+        cond_fn_input = {}
+        cond_fn_input['x'] = x
+        cond_fn_input['pred_xstart'] = clean_image
         eps = eps - (1 - alpha_bar).sqrt() * cond_fn(
-            x, self._scale_timesteps(t), **model_kwargs
+            cond_fn_input, self._scale_timesteps(t), **model_kwargs
         )
 
         out = p_mean_var.copy()
@@ -550,16 +563,18 @@ class GaussianDiffusion:
 
         Same usage as p_sample().
         """
-        out = self.p_mean_variance(
-            model,
-            x,
-            t,
-            clip_denoised=clip_denoised,
-            denoised_fn=denoised_fn,
-            model_kwargs=model_kwargs,
-        )
-        if cond_fn is not None:
-            out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
+        with th.enable_grad():
+            x = x.detach().requires_grad_(True) # Enable grad calculation for x
+            out = self.p_mean_variance(
+                model,
+                x,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                model_kwargs=model_kwargs,
+            )
+            if cond_fn is not None:
+                out = self.condition_score(cond_fn, out, x, t, model_kwargs=model_kwargs)
 
         # Usually our model outputs epsilon, but we re-derive it
         # in case we used x_start or x_prev prediction.
@@ -683,7 +698,6 @@ class GaussianDiffusion:
         else:
             img = th.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
-
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
@@ -692,19 +706,18 @@ class GaussianDiffusion:
 
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
-            with th.no_grad():
-                out = self.ddim_sample(
-                    model,
-                    img,
-                    t,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    cond_fn=cond_fn,
-                    model_kwargs=model_kwargs,
-                    eta=eta,
-                )
-                yield out
-                img = out["sample"]
+            out = self.ddim_sample(
+                model,
+                img,
+                t,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+                eta=eta,
+            )
+            yield out
+            img = out["sample"]
 
     def _vb_terms_bpd(
         self, model, x_start, x_t, t, clip_denoised=True, model_kwargs=None
@@ -890,7 +903,6 @@ class GaussianDiffusion:
             "xstart_mse": xstart_mse,
             "mse": mse,
         }
-
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
     """
