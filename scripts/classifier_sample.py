@@ -20,8 +20,6 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
-from vgg_perceptual_loss import VGGPerceptualLoss
-
 def main():
     args = create_argparser().parse_args()
 
