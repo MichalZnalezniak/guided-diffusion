@@ -42,12 +42,7 @@ def main():
     classifier.cuda()
     if args.classifier_use_fp16:
         classifier.convert_to_fp16()
-    print(classifier)
     classifier.eval()
-    # classifier = torchvision.models.vgg16(pretrained=True)
-    # classifier.eval()
-    # classifier = classifier.cuda()
-    print(classifier)
 
     normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                  std=[0.26862954, 0.26130258, 0.27577711])
