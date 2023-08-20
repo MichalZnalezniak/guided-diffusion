@@ -20,6 +20,7 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
+from vgg_perceptual_loss import VGGPerceptualLoss
 def main():
     args = create_argparser().parse_args()
 
@@ -43,7 +44,7 @@ def main():
     if args.classifier_use_fp16:
         classifier.convert_to_fp16()
     classifier.eval()
-
+    vgg_loss = VGGPerceptualLoss().cuda()
     normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                  std=[0.26862954, 0.26130258, 0.27577711])
     
@@ -77,7 +78,8 @@ def main():
 
             x_in_grad = th.zeros_like(x_in)
             x_in_normalized = normalize(x_in)
-            losses = th.nn.L1Loss()(x_in_normalized, init) # Calculated the loss          
+            losses = vgg_loss(x_in_normalized, init)
+            # losses = th.nn.L1Loss()(x_in_normalized, init) # Calculated the loss          
             x_in_grad = th.autograd.grad(losses.sum() * args.classifier_scale, x_in)[0] # Calculated the gradient of L1Loss with respect to `pred_xstart`
             grad = -th.autograd.grad(x_in, x, x_in_grad)[0] # Apply the chain rule to calculate the gradient of L1Loss with respect to 'x'
             return grad
@@ -111,7 +113,7 @@ def main():
         sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
         image = Image.fromarray(sample[0].cpu().numpy())
-        image.show()
+        image.save('./final_output_VGG.png')
 
         gathered_samples = sample
         all_images.extend([sample.cpu().numpy() for sample in gathered_samples])
