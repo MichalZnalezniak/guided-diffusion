@@ -20,7 +20,6 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
-from vgg_perceptual_loss import VGGPerceptualLoss
 
 def main():
     args = create_argparser().parse_args()
@@ -45,7 +44,6 @@ def main():
     if args.classifier_use_fp16:
         classifier.convert_to_fp16()
     classifier.eval()
-    vgg_loss = VGGPerceptualLoss().cuda()
     resnet50_dino = th.hub.load('facebookresearch/dino:main', 'dino_resnet50').eval().cuda()
 
     normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
@@ -61,7 +59,7 @@ def main():
             return th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
 
     def cond_fn_ssl(x, t, y=None):
-        init = Image.open('./diffusion_samples_output/example_image.png')
+        init = Image.open('./example_inputs/tucan.png')
         init = torchvision.transforms.ToTensor()(init).cuda().unsqueeze(0).mul(2).sub(1)
         init = normalize(init)
 
@@ -78,7 +76,7 @@ def main():
                 sample_temp = sample_temp.contiguous()
                 # for image in sample_temp:
                 image = Image.fromarray(sample_temp[0].cpu().numpy())
-                image.save(f'./pred_xstart_iter{t[0].item()}_{samples_to_generate}.png')
+                image.save(f'./example_outputs/pred_xstart_iter{t[0].item()}.png')
 
             # x_in_grad = th.zeros_like(x_in)
             x_in_normalized = normalize(x_in)
@@ -118,7 +116,7 @@ def main():
         sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
         image = Image.fromarray(sample[0].cpu().numpy())
-        image.save('./final_output_VGG.png')
+        image.save('./example_outputs/final_output.png')
         samples_to_generate = samples_to_generate - 1
 
         gathered_samples = sample
