@@ -48,8 +48,21 @@ def main():
     vgg_loss = VGGPerceptualLoss().cuda()
     resnet50_dino = th.hub.load('facebookresearch/dino:main', 'dino_resnet50').eval().cuda()
 
+    print(resnet50_dino)
+    activation = {}
+    def get_activation(name):
+        def hook(model, input, output):
+            activation[name] = output
+        return hook
+    resnet50_dino.layer1[2].relu.register_forward_hook(get_activation('layer1.block'))
+    resnet50_dino.layer2[3].relu.register_forward_hook(get_activation('layer2.block'))
+    resnet50_dino.layer3[5].relu.register_forward_hook(get_activation('layer3.block'))
+    resnet50_dino.layer4[2].relu.register_forward_hook(get_activation('layer4.block'))
+
     normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                  std=[0.26862954, 0.26130258, 0.27577711])
+    
+    samples_to_generate = args.num_samples
     
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -83,8 +96,24 @@ def main():
             # x_in_grad = th.zeros_like(x_in)
             x_in_normalized = normalize(x_in)
             x_in_latent_space_dino = resnet50_dino(x_in_normalized)
+            layer1_x_in_latent_space_dino = activation['layer1.block']
+            layer2_x_in_latent_space_dino = activation['layer2.block']
+            layer3_x_in_latent_space_dino = activation['layer3.block']
+            layer4_x_in_latent_space_dino = activation['layer4.block']
+
             init_latent_space_dino = resnet50_dino(init)
-            losses = th.nn.L1Loss()(x_in_latent_space_dino, init_latent_space_dino) # Calculated the loss          
+            layer1_init_latent_space_dino = activation['layer1.block']
+            layer2_init_latent_space_dino = activation['layer2.block']
+            layer3_init_latent_space_dino = activation['layer3.block']
+            layer4_init_latent_space_dino = activation['layer4.block']
+
+            layer1_loss = th.nn.L1Loss()(layer1_x_in_latent_space_dino,layer1_init_latent_space_dino)
+            layer2_loss = th.nn.L1Loss()(layer2_x_in_latent_space_dino,layer2_init_latent_space_dino)
+            layer3_loss = th.nn.L1Loss()(layer3_x_in_latent_space_dino,layer3_init_latent_space_dino)
+            layer4_loss = th.nn.L1Loss()(layer4_x_in_latent_space_dino,layer4_init_latent_space_dino)
+
+            losses = layer1_loss + layer2_loss + layer3_loss + layer4_loss
+            losses += th.nn.L1Loss()(x_in_latent_space_dino, init_latent_space_dino) # Calculated the loss          
             x_in_grad = th.autograd.grad(losses.sum() * args.classifier_scale, x_in)[0] # Calculated the gradient of L1Loss with respect to `pred_xstart`
             grad = -th.autograd.grad(x_in, x, x_in_grad)[0] # Apply the chain rule to calculate the gradient of L1Loss with respect to 'x'
             return grad
