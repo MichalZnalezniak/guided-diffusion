@@ -62,7 +62,7 @@ def main():
     init = torchvision.transforms.ToTensor()(init).cuda().unsqueeze(0).mul(2).sub(1)
     init = normalize(init)
     with torch.no_grad():
-        init_latent_space_dino = resnet50_dino(init).repeat([args.batch_size,1]) #TODO - Now global variable blee
+        init_latent_space_dino = resnet50_dino(init).repeat([args.batch_size, 1])  # TODO - Now global variable blee
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -81,26 +81,35 @@ def main():
             my_t = th.ones([n], dtype=th.long).cuda() * cur_t
             out = diffusion.p_mean_variance(model, x, my_t, clip_denoised=False, model_kwargs={})
             x_in = out['pred_xstart']
+
+            x_in_normalized = normalize(x_in)
+            # x_in_normalized = x_in
+            x_in_latent_space_dino = resnet50_dino(x_in_normalized)
+            if args.distance == "L1":
+                losses = th.nn.L1Loss(reduction="none")(x_in_latent_space_dino, init_latent_space_dino).mean(1)
+            elif args.distance == "MSE":
+                losses = th.nn.MSELoss(reduction="none")(x_in_latent_space_dino, init_latent_space_dino).mean(1)
+            elif args.distance == "cosine":
+                losses = 1 - th.nn.functional.cosine_similarity(x_in_latent_space_dino, init_latent_space_dino)
+            else:
+                raise NotImplementedError
+            wandb.log({"distance guided": losses[:args.batch_size//2].mean()})
+            wandb.log({"distance not guided": losses[args.batch_size // 2:].mean()})
+            losses = losses.mean()
+            grad = -th.autograd.grad(losses * args.classifier_scale, x)[0]
             if t[0].item() % 50 == 0:
                 sample_temp = ((out['pred_xstart'] + 1) * 127.5).clamp(0, 255).to(th.uint8)
                 sample_temp = sample_temp.contiguous()
                 samples_grid = make_grid(sample_temp, normalize=False)
                 wandb.log({f"intermediate_gen": wandb.Image(samples_grid)})
+                grad_grid = make_grid(grad, normalize=False)
+                wandb.log({f"intermediate_grad": wandb.Image(grad_grid)})
                 sample_temp = sample_temp.permute(0, 2, 3, 1)
                 # for image in sample_temp:
                 image = Image.fromarray(sample_temp[0].cpu().numpy())
                 image.save(f'./results/{args.experiment_name}/example_outputs/pred_xstart_iter{t[0].item()}.png')
                 # wandb.log({f"intermediate_gen": wandb.Image(image)})
 
-            # x_in_grad = th.zeros_like(x_in)
-            x_in_normalized = normalize(x_in)
-            x_in_latent_space_dino = resnet50_dino(x_in_normalized)
-            losses = th.nn.L1Loss()(x_in_latent_space_dino, init_latent_space_dino)  # Calculated the loss
-            wandb.log({"distance": losses})
-            x_in_grad = th.autograd.grad(losses.sum() * args.classifier_scale, x_in)[
-                0]  # Calculated the gradient of L1Loss with respect to `pred_xstart`
-            grad = -th.autograd.grad(x_in, x, x_in_grad)[
-                0]  # Apply the chain rule to calculate the gradient of L1Loss with respect to 'x'
             return grad
 
     def model_fn(x, t, y=None):
@@ -115,11 +124,14 @@ def main():
         classes = th.randint(
             low=99, high=100, size=(args.batch_size,), device=th.device('cuda')
         )
-        print(classes)
+        # print(classes)
         model_kwargs["y"] = classes
         sample_fn = (
             diffusion.p_sample_loop if not args.use_ddim else diffusion.ddim_sample_loop
         )
+        assert args.batch_size % 2 == 0
+        noise = th.randn((args.batch_size // 2, 3, args.image_size, args.image_size),
+                         device=th.device('cuda:0')).repeat(2, 1, 1, 1)
         sample = sample_fn(
             model_fn,
             (args.batch_size, 3, args.image_size, args.image_size),
@@ -127,6 +139,7 @@ def main():
             model_kwargs=model_kwargs,
             cond_fn=cond_fn_ssl,
             device=th.device('cuda:0'),
+            noise=noise
         )
         sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
         sample = sample.contiguous()
@@ -165,6 +178,7 @@ def create_argparser():
         classifier_path="",
         classifier_scale=1.0,
         experiment_name="test",
+        distance="MSE",
     )
     defaults.update(model_and_diffusion_defaults())
     defaults.update(classifier_defaults())
