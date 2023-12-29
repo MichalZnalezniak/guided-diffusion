@@ -11,6 +11,15 @@ import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision
 from guided_diffusion import dist_util, logger
+import torch
+import torch.nn as nn
+# import lpips
+import torch
+# from transformers import AutoImageProcessor, AutoModelForImageClassification
+# Set the seed to reproduce
+torch.manual_seed(0)
+
+
 from guided_diffusion.script_util import (
     NUM_CLASSES,
     model_and_diffusion_defaults,
@@ -20,10 +29,14 @@ from guided_diffusion.script_util import (
     add_dict_to_argparser,
     args_to_dict,
 )
-
+# from torchvision.io.image import read_image
+# from torchvision.models.segmentation import fcn_resnet50, FCN_ResNet50_Weights
+# from torchvision.transforms.functional import to_pil_image
+import torchvision
+from PIL import Image
 import wandb
 
-from vgg_perceptual_loss import VGGPerceptualLoss
+# from vgg_perceptual_loss import VGGPerceptualLoss
 
 def main():
 
@@ -47,16 +60,19 @@ def main():
         model.convert_to_fp16()
     model.cuda()
     model.eval()
+    loss_fn_vgg = lpips.LPIPS(net='vgg') # best forward scores
+    loss_fn_vgg.cuda()
 
     logger.log("loading classifier...")
-    classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
-    classifier.load_state_dict(th.load(args.classifier_path))
-    classifier.cuda()
-    if args.classifier_use_fp16:
-        classifier.convert_to_fp16()
+    # classifier = create_classifier(**args_to_dict(args, classifier_defaults().keys()))
+    # classifier.load_state_dict(th.load(args.classifier_path))
+    # classifier.cuda()
+    # if args.classifier_use_fp16:
+    #     classifier.convert_to_fp16()
+    # classifier.eval()
+    classifier = torchvision.models.alexnet(pretrained=True)
     classifier.eval()
-    vgg_loss = VGGPerceptualLoss().cuda()
-    resnet50_dino = th.hub.load('facebookresearch/dino:main', 'dino_resnet50').eval().cuda()
+    classifier.cuda()
 
     normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                  std=[0.26862954, 0.26130258, 0.27577711])
@@ -66,6 +82,131 @@ def main():
 
     # Define which metrics to plot against that x-axis
     wandb.define_metric("validation/*", step_metric='custom_step')
+
+
+    weights = FCN_ResNet50_Weights.DEFAULT
+    segm_model = fcn_resnet50(weights=weights)
+    segm_model.eval().cuda()
+    preprocess = weights.transforms()
+    class_to_idx = {cls: idx for (idx, cls) in enumerate(weights.meta["categories"])}
+
+    make_cutouts  = MakeCutouts(256, 1, 1)
+
+
+    def cond_fn_segmentation(x, t, y=None):
+        init = Image.open('./diffusion_samples_output/example_image.png')
+        init = torchvision.transforms.ToTensor()(init).cuda().unsqueeze(0)
+        batch_init = preprocess(init)
+        prediction_init = segm_model(batch_init)["out"]
+        normalized_masks_init = prediction_init.softmax(dim=1)
+        mask_init = normalized_masks_init[0, class_to_idx["bird"]]
+
+        with th.enable_grad():
+            x = x.detach().requires_grad_()
+            map_dif_steps_to_num_steps = {key : item.unsqueeze(0) for key, item in zip(diffusion.timestep_map, th.range(0, diffusion.num_timesteps).long())}
+            out = diffusion.p_mean_variance(model, x, map_dif_steps_to_num_steps[t.item()].cuda(), clip_denoised=False, model_kwargs={})
+            x_pred = out['pred_xstart']
+            sample_temp = ((x_pred + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            x_pred = (x_pred + 1) / 2 
+            samples_grid = torchvision.utils.make_grid(sample_temp, normalize=False)
+            x_in = x_pred
+            x_in_grad = torch.zeros_like(x_in)
+            # x_in_normalized = normalize(x_in)
+            batch_x_in = preprocess(x_in)
+            prediction_x_in= segm_model(batch_x_in)["out"]
+            normalized_masks_x_in = prediction_x_in.softmax(dim=1)
+            mask_x_in = normalized_masks_x_in[0, class_to_idx["bird"]]
+            losses = F.l1_loss(mask_init, mask_x_in)
+            x_in_grad += torch.autograd.grad(losses.sum() * args.classifier_scale, x_in)[0]
+            tv_losses = tv_loss(x_in)
+            range_losses = range_loss(out['pred_xstart'])
+            x_in_grad += torch.autograd.grad((tv_losses * 7500) + (range_losses * 1500), x_in)[0]
+            log_dict = {
+                "custom_step": wandb.run.step % 250,
+                f"validation/pred_xstart {samples_to_generate}": wandb.Image(samples_grid),
+                f"validation/loss {samples_to_generate}": losses.mean(),
+                f"validation/mask_pred {samples_to_generate} ": wandb.Image(mask_x_in),
+                f"validation/mask_target": wandb.Image(mask_init)
+
+            }
+            wandb.log(log_dict)
+            return -th.autograd.grad(x_in, x, x_in_grad)[0]
+
+    def new_cond_fn_xpred(x, t, y=None):
+        with torch.enable_grad():
+            x = x.detach().requires_grad_()
+            n = x.shape[0]
+            map_dif_steps_to_num_steps = {key : item.unsqueeze(0) for key, item in zip(diffusion.timestep_map, th.range(0, diffusion.num_timesteps).long())}
+            out = diffusion.p_mean_variance(model, x, map_dif_steps_to_num_steps[t.item()].cuda(), clip_denoised=False)
+            fac = diffusion.sqrt_one_minus_alphas_cumprod[map_dif_steps_to_num_steps[t.item()].cuda()]
+            x_in = out['pred_xstart']* fac + x * (1 - fac)
+            sample_temp = ((out['pred_xstart'] + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            samples_grid = torchvision.utils.make_grid(sample_temp, normalize=False)
+            x_in = normalize((x_in + 1) / 2)
+            logits1 = classifier(x_in)
+            log_probs1 = F.log_softmax(logits1, dim=-1)
+            selected1 = log_probs1[range(len(logits1)), y.view(-1)]
+            tv_losses = tv_loss(x_in)
+            range_losses = range_loss(out['pred_xstart'])            
+            loss = (tv_losses.sum() * 50) + (range_losses.sum() * 50)
+            all_losses = (selected1.sum() * args.classifier_scale) - loss
+            log_dict = {
+                "custom_step": wandb.run.step % 250,
+                f"validation/pred_xstart {samples_to_generate}": wandb.Image(samples_grid),
+                f"validation/loss {samples_to_generate}": F.softmax(logits1, dim=-1)[range(len(logits1)), y.view(-1)],
+            }
+            wandb.log(log_dict)
+            x_in_grad = th.autograd.grad(all_losses, x_in)[0] # Calculated the gradient of L1Loss with respect to `pred_xstart`
+            return th.autograd.grad(x_in, x, x_in_grad)[0]
+        
+    def cond_fn_xpred(x, t, y=None):
+        assert y is not None
+        with th.enable_grad():
+            x = x.detach().requires_grad_()
+            map_dif_steps_to_num_steps = {key : item.unsqueeze(0) for key, item in zip(diffusion.timestep_map, th.range(0, diffusion.num_timesteps).long())}
+            out = diffusion.p_mean_variance(model, x, map_dif_steps_to_num_steps[t.item()].cuda(), clip_denoised=False, model_kwargs={})
+            x_pred = out['pred_xstart']
+            sample_temp = ((x_pred + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            samples_grid = torchvision.utils.make_grid(sample_temp, normalize=False)
+            fac = diffusion.sqrt_one_minus_alphas_cumprod[map_dif_steps_to_num_steps[t.item()]]
+            x_in = out['pred_xstart'] * fac + x * (1 - fac)
+            x_in_norm = normalize((x_in + 1) / 2)
+            x_in_grad = torch.zeros_like(x_in)
+            batch = make_cutouts(x_in_norm)
+            transforms = torchvision.transforms.Compose([
+                                    torchvision.transforms.RandomResizedCrop(256),
+                                    torchvision.transforms.RandomHorizontalFlip(p=0.5),
+                                    torchvision.transforms.RandomApply([torchvision.transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)], p=0.8),
+                                    torchvision.transforms.RandomGrayscale(p=0.2)])
+            batch = transforms(batch)
+            logits2 = classifier(batch)
+            log_probs2 = F.log_softmax(logits2, dim=-1)
+            selected2 = log_probs2[range(len(logits2)), y.view(-1)]
+            classifier_scale = args.classifier_scale
+            x_in_grad += torch.autograd.grad(selected2.sum() * classifier_scale,  x_in)[0]
+            
+            tv_losses = tv_loss(x_in)
+            range_losses = range_loss(out['pred_xstart'])
+            mean = torch.mean(x_in, dim=(2, 3)).squeeze(0)
+            std = torch.std(x_in, dim=(2, 3)).squeeze(0)
+            mean_target=torch.tensor([0.48145466, 0.4578275, 0.40821073]).cuda()
+            std_target=torch.tensor([0.26862954, 0.26130258, 0.27577711]).cuda()
+            mse_mean = torch.nn.functional.mse_loss(mean, mean_target)
+            mse_std = torch.nn.functional.mse_loss(std, std_target)
+            mean_and_std_loss = mse_mean.sum() + mse_std.sum()
+            x_in_grad -= torch.autograd.grad((tv_losses * 75) + (range_losses * 15) + (mean_and_std_loss * 100) ,  x_in)[0]            
+            log_dict = {
+                "custom_step": wandb.run.step % 250,
+                f"validation/pred_xstart {samples_to_generate}": wandb.Image(samples_grid),
+                f"validation/loss_classifier {samples_to_generate}": F.softmax(logits2, dim=-1)[range(len(logits2)), y.view(-1)].sum() / 16,
+                f"validation/tv_loss {samples_to_generate}": tv_losses,
+                f"validation/range_loss {samples_to_generate}": range_losses,
+                f"validation/normalization_loss {samples_to_generate}": mean_and_std_loss,
+            }
+            wandb.log(log_dict)
+            return th.autograd.grad(x_in, x, x_in_grad)[0]
+            # return th.autograd.grad(x_in, x, x_in_grad)[0]
+
 
     def cond_fn(x, t, y=None):
         assert y is not None
@@ -88,33 +229,67 @@ def main():
             wandb.log(log_dict)
             return th.autograd.grad(selected.sum(), x_in)[0] * args.classifier_scale
 
-    def cond_fn_ssl(x, t, y=None):
+    def cond_fn_lpips(x, t, y=None):
+        init = Image.open('./diffusion_samples_output/example_image.png')
+        init = torchvision.transforms.ToTensor()(init).cuda().unsqueeze(0).mul(2).sub(1)
+        # init = normalize(init)
+
+        with th.enable_grad():
+            x = x.detach().requires_grad_()
+            map_dif_steps_to_num_steps = {key : item.unsqueeze(0) for key, item in zip(diffusion.timestep_map, th.range(0, diffusion.num_timesteps).long())}
+            out = diffusion.p_mean_variance(model, x, map_dif_steps_to_num_steps[t.item()].cuda(), clip_denoised=False, model_kwargs={})
+            x_pred = out['pred_xstart']
+            sample_temp = ((x_pred + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            samples_grid = torchvision.utils.make_grid(sample_temp, normalize=False)
+            fac = diffusion.sqrt_one_minus_alphas_cumprod[map_dif_steps_to_num_steps[t.item()]]
+            x_in = out['pred_xstart'] * fac + x * (1 - fac)
+            x_in_grad = torch.zeros_like(x_in)
+            batch = x_in
+            transforms = torchvision.transforms.Compose([
+                                    # torchvision.transforms.RandomResizedCrop(256),
+                                    # torchvision.transforms.RandomHorizontalFlip(p=0.5),
+                                    torchvision.transforms.RandomApply([torchvision.transforms.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
+                                    torchvision.transforms.RandomGrayscale(p=0.2)])
+            batch = transforms(batch)
+            loss_lpips = loss_fn_vgg(init, batch)
+            x_in_grad += torch.autograd.grad(loss_lpips.sum() * args.classifier_scale, x_in)[0]
+            tv_losses = tv_loss(x_in)
+            range_losses = range_loss(out['pred_xstart'])
+            x_in_grad += torch.autograd.grad((tv_losses * 750) + (range_losses * 150), x_in)[0]
+            log_dict = {
+                "custom_step": wandb.run.step % 250,
+                f"validation/pred_xstart {samples_to_generate}": wandb.Image(samples_grid),
+                f"validation/loss lpips {samples_to_generate}": loss_lpips.mean(),
+                f"validation/tv_loss {samples_to_generate}": tv_losses.mean(),
+                f"validation/range_loss {samples_to_generate}": range_losses.mean()
+            }
+            wandb.log(log_dict)
+            return -torch.autograd.grad(x_in, x, x_in_grad)[0]
+        
+    def cond_fn_mse(x, t, y=None):
         init = Image.open('./diffusion_samples_output/example_image.png')
         init = torchvision.transforms.ToTensor()(init).cuda().unsqueeze(0).mul(2).sub(1)
         init = normalize(init)
+
         with th.enable_grad():
             x = x.detach().requires_grad_()
-            n = x.shape[0]
-            cur_t = t[0].item()
-            my_t = th.ones([n], dtype=th.long).cuda() * cur_t
-            out = diffusion.p_mean_variance(model, x, my_t, clip_denoised=False, model_kwargs={})
-            x_in = out['pred_xstart']
-            if t[0].item() % 50 == 0:
-                sample_temp = ((out['pred_xstart'] + 1) * 127.5).clamp(0, 255).to(th.uint8)
-                sample_temp = sample_temp.permute(0, 2, 3, 1)
-                sample_temp = sample_temp.contiguous()
-                # for image in sample_temp:
-                # image = Image.fromarray(sample_temp[0].cpu().numpy())
-                # image.save(f'./pred_xstart_iter{t[0].item()}_{samples_to_generate}.png')
-
-            # x_in_grad = th.zeros_like(x_in)
+            map_dif_steps_to_num_steps = {key : item.unsqueeze(0) for key, item in zip(diffusion.timestep_map, th.range(0, diffusion.num_timesteps).long())}
+            out = diffusion.p_mean_variance(model, x, map_dif_steps_to_num_steps[t.item()].cuda(), clip_denoised=False, model_kwargs={})
+            x_pred = out['pred_xstart']
+            sample_temp = ((x_pred + 1) * 127.5).clamp(0, 255).to(th.uint8)
+            samples_grid = torchvision.utils.make_grid(sample_temp, normalize=False)
+            x_in = x_pred
+            x_in_grad = th.zeros_like(x_in)
             x_in_normalized = normalize(x_in)
-            x_in_latent_space_dino = resnet50_dino(x_in_normalized)
-            init_latent_space_dino = resnet50_dino(init)
-            losses = th.nn.L1Loss()(x_in_latent_space_dino, init_latent_space_dino) # Calculated the loss          
+            losses = th.nn.L1Loss()(x_in_normalized, init) # Calculated the loss          
             x_in_grad = th.autograd.grad(losses.sum() * args.classifier_scale, x_in)[0] # Calculated the gradient of L1Loss with respect to `pred_xstart`
-            grad = -th.autograd.grad(x_in, x, x_in_grad)[0] # Apply the chain rule to calculate the gradient of L1Loss with respect to 'x'
-            return grad
+            log_dict = {
+                "custom_step": wandb.run.step % 250,
+                f"validation/pred_xstart {samples_to_generate}": wandb.Image(samples_grid),
+                f"validation/loss {samples_to_generate}": losses.mean()
+            }
+            wandb.log(log_dict)
+            return -th.autograd.grad(x_in, x, x_in_grad)[0]
 
     def model_fn(x, t, y=None):
         assert y is not None
@@ -137,12 +312,13 @@ def main():
             (args.batch_size, 3, args.image_size, args.image_size),
             clip_denoised=args.clip_denoised,
             model_kwargs=model_kwargs,
-            cond_fn=cond_fn ,
-            device=th.device('cuda'),
+            cond_fn=new_cond_fn_xpred ,
+            device=th.device('cuda'),   
         )
-        sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
-        sample = sample.permute(0, 2, 3, 1)
+        # sample = ((sample + 1) * 127.5).clamp(0, 255).to(th.uint8)
+        # sample = sample.permute(0, 2, 3, 1)
         sample = sample.contiguous()
+        torchvision.utils.save_image(sample , f"./artificial_dataset/picture{samples_to_generate}.png")
         # image = Image.fromarray(sample[0].cpu().numpy())
         # image.save('./final_output_VGG.png')
         samples_to_generate = samples_to_generate - 1
@@ -183,6 +359,40 @@ def create_argparser():
     add_dict_to_argparser(parser, defaults)
     return parser
 
+def tv_loss(input):
+    """L2 total variation loss, as in Mahendran et al."""
+    input = F.pad(input, (0, 1, 0, 1), 'replicate')
+    x_diff = input[..., :-1, 1:] - input[..., :-1, :-1]
+    y_diff = input[..., 1:, :-1] - input[..., :-1, :-1]
+    return (x_diff**2 + y_diff**2).mean([1, 2, 3])
+
+
+def range_loss(input):
+    return (input - input.clamp(-1, 1)).pow(2).mean([1, 2, 3])
+
+
+class MakeCutouts(nn.Module):
+    def __init__(self, cut_size, cutn, cut_pow=1.):
+        super().__init__()
+        self.cut_size = cut_size
+        self.cutn = cutn
+        self.cut_pow = cut_pow      
+
+    def forward(self, input):
+        sideY, sideX = input.shape[2:4]
+        max_size = min(sideX, sideY)
+        min_size = min(sideX, sideY, self.cut_size)
+        
+        cutouts = []
+        for _ in range(self.cutn):
+            size = int(torch.rand([])**self.cut_pow * (max_size - min_size) + min_size)
+            offsetx = torch.randint(0, sideX - size + 1, ())
+            offsety = torch.randint(0, sideY - size + 1, ())
+            cutout = input[:, :, offsety:offsety + size, offsetx:offsetx + size]
+            cutouts.append(F.adaptive_avg_pool2d(cutout, self.cut_size))
+            #cutouts.append(F.adaptive_max_pool2d(cutout, self.cut_size))
+
+        return torch.cat(cutouts)
 
 if __name__ == "__main__":
     main()
